@@ -34,6 +34,7 @@ use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_types::BuildContext;
 use uv_workspace::{VirtualProject, Workspace};
 
+use crate::requires_python::SimplifiedMarkerTree;
 use crate::resolution::{AnnotatedDist, ResolutionGraphNode};
 use crate::{ExcludeNewer, PrereleaseMode, RequiresPython, ResolutionGraph, ResolutionMode};
 
@@ -352,7 +353,24 @@ impl Lock {
     /// Record the supported environments that were used to generate this lock.
     #[must_use]
     pub fn with_supported_environments(mut self, supported_environments: Vec<MarkerTree>) -> Self {
-        self.supported_environments = supported_environments;
+        // We "complexify" the markers given, since the supported
+        // environments given might be coming directly from what's written in
+        // `pyproject.toml`, and those are assumed to be simplified (i.e.,
+        // they assume `requires-python` is true). But a `Lock` always uses
+        // non-simplified markers internally, so we need to re-complexify them
+        // here.
+        //
+        // The nice thing about complexifying is that it's a no-op if the
+        // markers given have already been complexified.
+        self.supported_environments = supported_environments
+            .into_iter()
+            .map(|marker| {
+                let Some(ref requires_python) = self.requires_python else {
+                    return marker;
+                };
+                requires_python.complexify_markers(marker)
+            })
+            .collect();
         self
     }
 
@@ -399,6 +417,27 @@ impl Lock {
     /// Returns the supported environments that were used to generate this lock.
     pub fn supported_environments(&self) -> &[MarkerTree] {
         &self.supported_environments
+    }
+
+    /// Returns the supported environments that were used to generate this
+    /// lock.
+    ///
+    /// The markers returned here are "simplified" with respect to the lock
+    /// file's `requires-python` setting. This means these should only be used
+    /// for direct comparison purposes with the supported environments written
+    /// by a human in `pyproject.toml`. (Think of "supported environments" in
+    /// `pyproject.toml` as having an implicit `and python_full_version >=
+    /// '{requires-python-bound}'` attached to each one.)
+    pub fn simplified_supported_environments(&self) -> Vec<MarkerTree> {
+        self.supported_environments()
+            .iter()
+            .map(|marker| {
+                let Some(ref requires_python) = self.requires_python else {
+                    return marker.clone();
+                };
+                requires_python.simplify_markers(marker.clone())
+            })
+            .collect()
     }
 
     /// If this lockfile was built from a forking resolution with non-identical forks, return the
@@ -508,8 +547,10 @@ impl Lock {
             let fork_markers = each_element_on_its_line_array(
                 self.fork_markers
                     .iter()
-                    .filter_map(MarkerTree::contents)
-                    .map(|marker| marker.to_string()),
+                    .map(|marker| {
+                        SimplifiedMarkerTree::new(self.requires_python.as_ref(), marker.clone())
+                    })
+                    .filter_map(|marker| marker.try_to_string()),
             );
             doc.insert("resolution-markers", value(fork_markers));
         }
@@ -518,8 +559,10 @@ impl Lock {
             let supported_environments = each_element_on_its_line_array(
                 self.supported_environments
                     .iter()
-                    .filter_map(MarkerTree::contents)
-                    .map(|marker| marker.to_string()),
+                    .map(|marker| {
+                        SimplifiedMarkerTree::new(self.requires_python.as_ref(), marker.clone())
+                    })
+                    .filter_map(|marker| marker.try_to_string()),
             );
             doc.insert("supported-markers", value(supported_environments));
         }
@@ -623,7 +666,7 @@ impl Lock {
 
         let mut packages = ArrayOfTables::new();
         for dist in &self.packages {
-            packages.push(dist.to_toml(&dist_count_by_name)?);
+            packages.push(dist.to_toml(self.requires_python.as_ref(), &dist_count_by_name)?);
         }
 
         doc.insert("package", Item::ArrayOfTables(packages));
@@ -978,9 +1021,9 @@ struct LockWire {
     /// If this lockfile was built from a forking resolution with non-identical forks, store the
     /// forks in the lockfile so we can recreate them in subsequent resolutions.
     #[serde(rename = "resolution-markers", default)]
-    fork_markers: Vec<MarkerTree>,
+    fork_markers: Vec<SimplifiedMarkerTree>,
     #[serde(rename = "supported-markers", default)]
-    supported_environments: Vec<MarkerTree>,
+    supported_environments: Vec<SimplifiedMarkerTree>,
     /// We discard the lockfile if these options match.
     #[serde(default)]
     options: ResolverOptions,
@@ -988,20 +1031,6 @@ struct LockWire {
     manifest: ResolverManifest,
     #[serde(rename = "package", alias = "distribution", default)]
     packages: Vec<PackageWire>,
-}
-
-impl From<Lock> for LockWire {
-    fn from(lock: Lock) -> LockWire {
-        LockWire {
-            version: lock.version,
-            requires_python: lock.requires_python,
-            fork_markers: lock.fork_markers,
-            supported_environments: lock.supported_environments,
-            options: lock.options,
-            manifest: lock.manifest,
-            packages: lock.packages.into_iter().map(PackageWire::from).collect(),
-        }
-    }
 }
 
 impl TryFrom<LockWire> for Lock {
@@ -1028,17 +1057,62 @@ impl TryFrom<LockWire> for Lock {
         let packages = wire
             .packages
             .into_iter()
-            .map(|dist| dist.unwire(&unambiguous_package_ids))
+            .map(|dist| dist.unwire(wire.requires_python.as_ref(), &unambiguous_package_ids))
             .collect::<Result<Vec<_>, _>>()?;
-        Lock::new(
+        let supported_environments = wire
+            .supported_environments
+            .into_iter()
+            .map(|simplified_marker| simplified_marker.into_marker(wire.requires_python.as_ref()))
+            .collect();
+        let fork_markers = wire
+            .fork_markers
+            .into_iter()
+            .map(|simplified_marker| simplified_marker.into_marker(wire.requires_python.as_ref()))
+            .collect();
+        let lock = Lock::new(
             wire.version,
             packages,
             wire.requires_python,
             wire.options,
             wire.manifest,
-            wire.supported_environments,
-            wire.fork_markers,
-        )
+            supported_environments,
+            fork_markers,
+        )?;
+
+        /*
+        // TODO: Use the below in tests to validate we don't produce a
+        // trivially incorrect lock file.
+        let mut name_to_markers: BTreeMap<&PackageName, Vec<(&Version, &MarkerTree)>> =
+            BTreeMap::new();
+        for package in &lock.packages {
+            for dep in &package.dependencies {
+                name_to_markers
+                    .entry(&dep.package_id.name)
+                    .or_default()
+                    .push((&dep.package_id.version, &dep.marker));
+            }
+        }
+        for (name, marker_trees) in name_to_markers {
+            for (i, (version1, marker1)) in marker_trees.iter().enumerate() {
+                for (version2, marker2) in &marker_trees[i + 1..] {
+                    if version1 == version2 {
+                        continue;
+                    }
+                    if !marker1.is_disjoint(marker2) {
+                        eprintln!("{}", lock.to_toml().unwrap());
+                        assert!(
+                            false,
+                            "[{marker1:?}] (for version {version1}) is not disjoint with \
+                             [{marker2:?}] (for version {version2}) \
+                             for package `{name}`",
+                        );
+                    }
+                }
+            }
+        }
+        */
+
+        Ok(lock)
     }
 }
 
@@ -1346,7 +1420,11 @@ impl Package {
         Ok(Some(sdist))
     }
 
-    fn to_toml(&self, dist_count_by_name: &FxHashMap<PackageName, u64>) -> anyhow::Result<Table> {
+    fn to_toml(
+        &self,
+        requires_python: Option<&RequiresPython>,
+        dist_count_by_name: &FxHashMap<PackageName, u64>,
+    ) -> anyhow::Result<Table> {
         let mut table = Table::new();
 
         self.id.to_toml(None, &mut table);
@@ -1355,28 +1433,27 @@ impl Package {
             let wheels = each_element_on_its_line_array(
                 self.fork_markers
                     .iter()
-                    .filter_map(MarkerTree::contents)
-                    .map(|marker| marker.to_string()),
+                    .map(|marker| SimplifiedMarkerTree::new(requires_python, marker.clone()))
+                    .filter_map(|marker| marker.try_to_string()),
             );
             table.insert("resolution-markers", value(wheels));
         }
 
         if !self.dependencies.is_empty() {
-            let deps = each_element_on_its_line_array(
-                self.dependencies
-                    .iter()
-                    .map(|dep| dep.to_toml(dist_count_by_name).into_inline_table()),
-            );
+            let deps = each_element_on_its_line_array(self.dependencies.iter().map(|dep| {
+                dep.to_toml(requires_python, dist_count_by_name)
+                    .into_inline_table()
+            }));
             table.insert("dependencies", value(deps));
         }
 
         if !self.optional_dependencies.is_empty() {
             let mut optional_deps = Table::new();
             for (extra, deps) in &self.optional_dependencies {
-                let deps = each_element_on_its_line_array(
-                    deps.iter()
-                        .map(|dep| dep.to_toml(dist_count_by_name).into_inline_table()),
-                );
+                let deps = each_element_on_its_line_array(deps.iter().map(|dep| {
+                    dep.to_toml(requires_python, dist_count_by_name)
+                        .into_inline_table()
+                }));
                 if !deps.is_empty() {
                     optional_deps.insert(extra.as_ref(), value(deps));
                 }
@@ -1389,10 +1466,10 @@ impl Package {
         if !self.dev_dependencies.is_empty() {
             let mut dev_dependencies = Table::new();
             for (extra, deps) in &self.dev_dependencies {
-                let deps = each_element_on_its_line_array(
-                    deps.iter()
-                        .map(|dep| dep.to_toml(dist_count_by_name).into_inline_table()),
-                );
+                let deps = each_element_on_its_line_array(deps.iter().map(|dep| {
+                    dep.to_toml(requires_python, dist_count_by_name)
+                        .into_inline_table()
+                }));
                 if !deps.is_empty() {
                     dev_dependencies.insert(extra.as_ref(), value(deps));
                 }
@@ -1569,7 +1646,7 @@ struct PackageWire {
     #[serde(default)]
     wheels: Vec<Wheel>,
     #[serde(default, rename = "resolution-markers")]
-    fork_markers: Vec<MarkerTree>,
+    fork_markers: Vec<SimplifiedMarkerTree>,
     #[serde(default)]
     dependencies: Vec<DependencyWire>,
     #[serde(default)]
@@ -1590,11 +1667,12 @@ struct PackageMetadata {
 impl PackageWire {
     fn unwire(
         self,
+        requires_python: Option<&RequiresPython>,
         unambiguous_package_ids: &FxHashMap<PackageName, PackageId>,
     ) -> Result<Package, LockError> {
         let unwire_deps = |deps: Vec<DependencyWire>| -> Result<Vec<Dependency>, LockError> {
             deps.into_iter()
-                .map(|dep| dep.unwire(unambiguous_package_ids))
+                .map(|dep| dep.unwire(requires_python, unambiguous_package_ids))
                 .collect()
         };
         Ok(Package {
@@ -1602,7 +1680,11 @@ impl PackageWire {
             metadata: self.metadata,
             sdist: self.sdist,
             wheels: self.wheels,
-            fork_markers: self.fork_markers,
+            fork_markers: self
+                .fork_markers
+                .into_iter()
+                .map(|simplified_marker| simplified_marker.into_marker(requires_python))
+                .collect(),
             dependencies: unwire_deps(self.dependencies)?,
             optional_dependencies: self
                 .optional_dependencies
@@ -1615,32 +1697,6 @@ impl PackageWire {
                 .map(|(group, deps)| Ok((group, unwire_deps(deps)?)))
                 .collect::<Result<_, LockError>>()?,
         })
-    }
-}
-
-impl From<Package> for PackageWire {
-    fn from(dist: Package) -> PackageWire {
-        let wire_deps = |deps: Vec<Dependency>| -> Vec<DependencyWire> {
-            deps.into_iter().map(DependencyWire::from).collect()
-        };
-        PackageWire {
-            id: dist.id,
-            metadata: dist.metadata,
-            sdist: dist.sdist,
-            wheels: dist.wheels,
-            fork_markers: dist.fork_markers,
-            dependencies: wire_deps(dist.dependencies),
-            optional_dependencies: dist
-                .optional_dependencies
-                .into_iter()
-                .map(|(extra, deps)| (extra, wire_deps(deps)))
-                .collect(),
-            dev_dependencies: dist
-                .dev_dependencies
-                .into_iter()
-                .map(|(group, deps)| (group, wire_deps(deps)))
-                .collect(),
-        }
     }
 }
 
@@ -2624,7 +2680,11 @@ impl Dependency {
     }
 
     /// Returns the TOML representation of this dependency.
-    fn to_toml(&self, dist_count_by_name: &FxHashMap<PackageName, u64>) -> Table {
+    fn to_toml(
+        &self,
+        requires_python: Option<&RequiresPython>,
+        dist_count_by_name: &FxHashMap<PackageName, u64>,
+    ) -> Table {
         let mut table = Table::new();
         self.package_id
             .to_toml(Some(dist_count_by_name), &mut table);
@@ -2636,8 +2696,9 @@ impl Dependency {
                 .collect::<Array>();
             table.insert("extra", value(extra_array));
         }
-        if let Some(marker) = self.marker.contents() {
-            table.insert("marker", value(marker.to_string()));
+        let simplified_marker = SimplifiedMarkerTree::new(requires_python, self.marker.clone());
+        if let Some(marker) = simplified_marker.try_to_string() {
+            table.insert("marker", value(marker));
         }
 
         table
@@ -2673,29 +2734,20 @@ struct DependencyWire {
     #[serde(default)]
     extra: BTreeSet<ExtraName>,
     #[serde(default)]
-    marker: MarkerTree,
+    marker: SimplifiedMarkerTree,
 }
 
 impl DependencyWire {
     fn unwire(
         self,
+        requires_python: Option<&RequiresPython>,
         unambiguous_package_ids: &FxHashMap<PackageName, PackageId>,
     ) -> Result<Dependency, LockError> {
         Ok(Dependency {
             package_id: self.package_id.unwire(unambiguous_package_ids)?,
             extra: self.extra,
-            marker: self.marker,
+            marker: self.marker.into_marker(requires_python),
         })
-    }
-}
-
-impl From<Dependency> for DependencyWire {
-    fn from(dependency: Dependency) -> DependencyWire {
-        DependencyWire {
-            package_id: PackageIdForDependency::from(dependency.package_id),
-            extra: dependency.extra,
-            marker: dependency.marker,
-        }
     }
 }
 
