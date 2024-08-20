@@ -784,7 +784,7 @@ fn sync_environment() -> Result<()> {
 
     ----- stderr -----
     Resolved 2 packages in [TIME]
-    error: The current Python platform is not compatible with the lockfile's supported environments: `python_full_version < '3.11'`
+    error: The current Python platform is not compatible with the lockfile's supported environments: `python_full_version == '3.10.*'`
     "###);
 
     assert!(context.temp_dir.child("uv.lock").exists());
