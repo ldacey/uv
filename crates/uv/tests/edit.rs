@@ -1844,6 +1844,7 @@ fn update() -> Result<()> {
         version = "0.1.0"
         source = { editable = "." }
         dependencies = [
+            { name = "requests" },
             { name = "requests", extra = ["socks", "use-chardet-on-py3"] },
         ]
 
