@@ -471,7 +471,7 @@ impl Ord for RequiresPythonBound {
     }
 }
 
-/// A simplifed marker is just like a normal marker, except it has possibly
+/// A simplified marker is just like a normal marker, except it has possibly
 /// been simplified by `requires-python`.
 ///
 /// A simplified marker should only exist in contexts where a `requires-python`
